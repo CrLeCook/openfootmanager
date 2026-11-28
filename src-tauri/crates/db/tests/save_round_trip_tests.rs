@@ -23,9 +23,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use db::save_manager::SaveManager;
 use domain::manager::Manager;
+use domain::player::{PlayerMovementKind, Position, SquadRole};
 use domain::stats::StatsState;
 use ofm_core::career::{CareerScope, begin_career};
 use ofm_core::clock::GameClock;
@@ -35,6 +36,10 @@ use ofm_core::game::Game;
 use ofm_core::generator::{
     DefinitionSources, WorldGenConfig, generate_world_data_seeded_with,
     repair_opening_youth_academies,
+};
+use ofm_core::season_context::derive_season_context;
+use ofm_core::transfers::{
+    TransferNegotiationDecision, evaluate_transfer_market, make_transfer_bid,
 };
 use ofm_core::turn;
 use serde_json::Value;
@@ -373,6 +378,303 @@ fn assert_nothing_lost(game: &Game, stats: &StatsState, moment: &str) {
         lost.len(),
         lost.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
     );
+}
+
+const FEE: u64 = 50_000_000;
+
+fn move_to_the_transfer_window(game: &mut Game) {
+    // A career opens before the first window does. Move to its opening day and derive the context
+    // as a load will, so the window status compared after the round trip is the derived one.
+    let opens_on = game
+        .season_context
+        .transfer_window
+        .opens_on
+        .clone()
+        .expect("the first season has a transfer window");
+    let opens_on = NaiveDate::parse_from_str(&opens_on, "%Y-%m-%d")
+        .expect("the window opening is a readable date");
+    game.clock.current_date = Utc.from_utc_datetime(
+        &opens_on
+            .and_hms_opt(12, 0, 0)
+            .expect("noon is a valid time"),
+    );
+    game.season_context = derive_season_context(game);
+}
+
+/// The user's club can afford any bid in this test without changing what is compared: the budget
+/// is part of the game and is saved with it.
+fn give_the_user_money_to_buy(game: &mut Game) {
+    let user_club = game
+        .manager
+        .team_id
+        .clone()
+        .expect("the manager has a club");
+    let team = game
+        .teams
+        .iter_mut()
+        .find(|team| team.id == user_club)
+        .expect("the user's club is in the game");
+    team.finance = 1_000_000_000;
+    team.transfer_budget = 1_000_000_000;
+    team.wage_budget = 1_000_000_000;
+}
+
+/// Given a career with room to buy, when the user bids a fee for an AI club's player, then the
+/// first accepted deal moves him. Returns his id and the club that sold him.
+fn user_completes_a_fee_transfer(game: &mut Game) -> (String, String) {
+    let user_club = game
+        .manager
+        .team_id
+        .clone()
+        .expect("the manager has a club");
+    move_to_the_transfer_window(game);
+    give_the_user_money_to_buy(game);
+
+    let candidates: Vec<String> = game
+        .players
+        .iter()
+        .filter(|player| {
+            player
+                .team_id
+                .as_deref()
+                .is_some_and(|club| club != user_club)
+                && player.squad_role == SquadRole::Senior
+                && !player.retired
+        })
+        .map(|player| player.id.clone())
+        .collect();
+
+    for player_id in candidates {
+        let seller = game
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+            .and_then(|player| player.team_id.clone())
+            .expect("the candidate has a club");
+        let accepted = make_transfer_bid(game, &player_id, FEE)
+            .is_ok_and(|outcome| outcome.decision == TransferNegotiationDecision::Accepted);
+        if !accepted {
+            continue;
+        }
+        let moved = game
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+            .is_some_and(|player| player.team_id.as_deref() == Some(user_club.as_str()));
+        if moved {
+            return (player_id, seller);
+        }
+    }
+
+    panic!("no AI club accepted a fee bid from the user");
+}
+
+/// Whether an AI club still has room in a position group (the market refuses a buyer at the
+/// surplus threshold), computed from the same senior registrations the market uses.
+fn an_ai_club_has_room_for(game: &Game, user_club: &str, group: &Position) -> bool {
+    game.teams.iter().any(|team| {
+        if team.id == user_club {
+            return false;
+        }
+        let count = game
+            .players
+            .iter()
+            .filter(|player| {
+                player.team_id.as_deref() == Some(team.id.as_str())
+                    && player.squad_role == SquadRole::Senior
+                    && &player.position.to_group_position() == group
+            })
+            .count();
+        count < 8
+    })
+}
+
+/// Given a career with every other AI player unattractive, when the market runs a day, then an AI
+/// club buys the one listed player whose contract is about to end. Returns his id, the seller and
+/// the buyer.
+fn an_ai_club_completes_a_fee_transfer(game: &mut Game) -> (String, String, String) {
+    let user_club = game
+        .manager
+        .team_id
+        .clone()
+        .expect("the manager has a club");
+    move_to_the_transfer_window(game);
+
+    // Only one player should clear the AI-to-AI bar (more than 60): every other AI player gets no
+    // listing, no value and no low-morale bonus.
+    for player in game.players.iter_mut() {
+        if player
+            .team_id
+            .as_deref()
+            .is_some_and(|club| club != user_club)
+        {
+            player.transfer_listed = false;
+            player.market_value = 0;
+            player.morale = 70;
+        }
+    }
+    for team in game.teams.iter_mut() {
+        if team.id != user_club {
+            team.finance = 1_000_000_000;
+            team.transfer_budget = 1_000_000_000;
+            team.wage_budget = 1_000_000_000;
+        }
+    }
+
+    let deadline = game.clock.current_date.date_naive() + chrono::Duration::days(365);
+    let candidates: Vec<String> = game
+        .players
+        .iter()
+        .filter(|player| {
+            player
+                .team_id
+                .as_deref()
+                .is_some_and(|club| club != user_club)
+                && player.squad_role == SquadRole::Senior
+                && !player.retired
+                && player
+                    .contract_end()
+                    .and_then(|end| NaiveDate::parse_from_str(end, "%Y-%m-%d").ok())
+                    .is_some_and(|end| end <= deadline)
+        })
+        .map(|player| player.id.clone())
+        .collect();
+
+    for player_id in candidates {
+        let (seller, group) = game
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+            .map(|player| {
+                (
+                    player.team_id.clone().expect("the candidate has a club"),
+                    player.position.to_group_position(),
+                )
+            })
+            .expect("the candidate is in the game");
+        if !an_ai_club_has_room_for(game, &user_club, &group) {
+            continue;
+        }
+
+        // Score 70: listed (30), inside 365 days (10 or more) and valued at least 1,000,000 (20),
+        // with low morale (10). No recorded contract is staged over.
+        let player = game
+            .players
+            .iter_mut()
+            .find(|player| player.id == player_id)
+            .expect("the candidate is in the game");
+        player.transfer_listed = true;
+        player.market_value = 1_200_000;
+        player.morale = 30;
+
+        evaluate_transfer_market(game);
+
+        let moved_to = game
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+            .and_then(|player| player.team_id.clone());
+        if let Some(buyer) = moved_to
+            && buyer != user_club
+            && buyer != seller
+        {
+            return (player_id, seller, buyer);
+        }
+
+        // Put the candidate back and try another position in case every buyer is full there.
+        let player = game
+            .players
+            .iter_mut()
+            .find(|player| player.id == player_id)
+            .expect("the candidate is in the game");
+        player.transfer_listed = false;
+        player.market_value = 0;
+        player.morale = 70;
+    }
+
+    panic!("no AI club bought an AI club's player");
+}
+
+/// Given a career in which the user has completed a fee transfer from an AI club,
+/// When it is saved and loaded back,
+/// Then the transfer, both clubs' money and the player's contract are the ones that were saved.
+#[test]
+fn a_career_after_a_fee_transfer_loads_back_unchanged() {
+    let (mut game, stats) = career();
+    let user_club = game
+        .manager
+        .team_id
+        .clone()
+        .expect("the manager has a club");
+    let (player_id, seller) = user_completes_a_fee_transfer(&mut game);
+
+    let player = game
+        .players
+        .iter()
+        .find(|player| player.id == player_id)
+        .expect("the bought player is in the game");
+    assert_eq!(
+        player.team_id.as_deref(),
+        Some(user_club.as_str()),
+        "the transfer is in the game that is saved"
+    );
+    let movement = player
+        .movement_history
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == PlayerMovementKind::PermanentTransfer)
+        .expect("the permanent transfer is recorded");
+    assert_eq!(movement.fee, Some(FEE));
+    assert_eq!(movement.from_team_id.as_deref(), Some(seller.as_str()));
+    assert_eq!(movement.to_team_id.as_deref(), Some(user_club.as_str()));
+    assert!(
+        !game.cash_journal.is_empty(),
+        "the fee posted to the cash journal"
+    );
+
+    assert_nothing_lost(&game, &stats, "after a user fee transfer");
+}
+
+/// Given a career in which one AI club has completed a fee transfer from another,
+/// When it is saved and loaded back,
+/// Then the transfer record, the two budgets, the contract ledger and the cash journal survive.
+#[test]
+fn a_career_after_an_ai_fee_transfer_loads_back_unchanged() {
+    let (mut game, stats) = career();
+    let user_club = game
+        .manager
+        .team_id
+        .clone()
+        .expect("the manager has a club");
+    let (player_id, seller, buyer) = an_ai_club_completes_a_fee_transfer(&mut game);
+
+    let player = game
+        .players
+        .iter()
+        .find(|player| player.id == player_id)
+        .expect("the bought player is in the game");
+    assert_eq!(
+        player.team_id.as_deref(),
+        Some(buyer.as_str()),
+        "the AI deal is in the game that is saved"
+    );
+    let movement = player
+        .movement_history
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == PlayerMovementKind::PermanentTransfer)
+        .expect("the permanent transfer is recorded");
+    assert!(movement.fee.is_some_and(|fee| fee > 0));
+    assert_eq!(movement.from_team_id.as_deref(), Some(seller.as_str()));
+    assert_eq!(movement.to_team_id.as_deref(), Some(buyer.as_str()));
+    assert_ne!(seller, user_club, "the seller took no part as the user");
+    assert_ne!(buyer, user_club, "the buyer took no part as the user");
+    assert!(
+        !game.cash_journal.is_empty(),
+        "the fee posted to the cash journal"
+    );
+
+    assert_nothing_lost(&game, &stats, "after an AI fee transfer");
 }
 
 /// Given a career that has just begun on a generated world,
